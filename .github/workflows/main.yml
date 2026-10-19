@@ -1,0 +1,98 @@
+
+name: Secure RDP
+
+on:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  secure-rdp:
+    runs-on: windows-latest
+    timeout-minutes: 360
+
+    steps:
+      - name: Configure RDP Security
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
+            -Name 'fDenyTSConnections' -Value 0
+
+          # Keep Network Level Authentication enabled.
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name 'UserAuthentication' -Value 1
+
+          Set-ItemProperty `
+            -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
+            -Name 'SecurityLayer' -Value 2
+
+          Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'
+
+          Write-Host "RDP security settings configured."
+
+      - name: Check Required Secrets
+        shell: powershell
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
+            throw "RDP_PASSWORD secret is missing."
+          }
+
+          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
+            throw "TAILSCALE_AUTH_KEY secret is missing."
+          }
+
+          Write-Host "Required secrets are configured."
+
+      - name: Install Tailscale
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $installer = Join-Path $env:TEMP "tailscale.msi"
+          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+
+          Invoke-WebRequest -Uri $url -OutFile $installer
+
+          try {
+            $process = Start-Process msiexec.exe `
+              -ArgumentList "/i", "`"$installer`"", "/quiet", "/norestart" `
+              -Wait -PassThru
+
+            if ($process.ExitCode -notin @(0, 3010)) {
+              throw "Tailscale installation failed: $($process.ExitCode)"
+            }
+          }
+          finally {
+            Remove-Item $installer -Force -ErrorAction SilentlyContinue
+          }
+
+          $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          if (-not (Test-Path $tsExe)) {
+            throw "Tailscale executable was not found."
+          }
+
+          Write-Host "Tailscale installed."
+
+      - name: Verify Environment
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          Get-ComputerInfo |
+            Select-Object WindowsProductName, WindowsVersion
+
+          Get-Service TermService |
+            Select-Object Name, Status
+
+          Write-Host "Environment check complete."

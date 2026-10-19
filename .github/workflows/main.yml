@@ -1,115 +1,265 @@
-
-name: Secure RDP
+name: RDP
 
 on:
   workflow_dispatch:
 
-permissions:
-  contents: read
-
 jobs:
   secure-rdp:
     runs-on: windows-latest
-    timeout-minutes: 360
+    timeout-minutes: 330
 
     steps:
-      - name: Configure RDP Security
+
+      # ==========================================
+      # Enable Remote Desktop
+      # ==========================================
+      - name: Configure RDP Settings
         shell: powershell
         run: |
-          $ErrorActionPreference = "Stop"
 
           Set-ItemProperty `
             -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
-            -Name 'fDenyTSConnections' -Value 0
+            -Name "fDenyTSConnections" `
+            -Value 0 `
+            -Force
 
           Set-ItemProperty `
             -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name 'UserAuthentication' -Value 1
+            -Name "UserAuthentication" `
+            -Value 1 `
+            -Force
 
           Set-ItemProperty `
             -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
-            -Name 'SecurityLayer' -Value 2
+            -Name "SecurityLayer" `
+            -Value 1 `
+            -Force
 
-          Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'
+          netsh advfirewall firewall delete rule name="RDP-Tailscale"
 
-          Write-Host "RDP security configured."
+          netsh advfirewall firewall add rule `
+            name="RDP-Tailscale" `
+            dir=in `
+            action=allow `
+            protocol=TCP `
+            localport=3389
 
-      - name: Validate Secrets
+          Restart-Service TermService -Force
+
+
+      # ==========================================
+      # Create RDP User
+      # ==========================================
+      - name: Create RDP User
         shell: powershell
-        env:
-          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
-          TAILSCALE_AUTH_KEY: ${{ secrets.TAILSCALE_AUTH_KEY }}
         run: |
-          $ErrorActionPreference = "Stop"
 
-          if ([string]::IsNullOrWhiteSpace($env:RDP_PASSWORD)) {
-            throw "RDP_PASSWORD secret is missing."
+          $username = "${{ secrets.RDP_USERNAME }}"
+          $password = "${{ secrets.RDP_PASSWORD }}"
+
+          # Check username
+          if ([string]::IsNullOrWhiteSpace($username)) {
+              Write-Error "RDP_USERNAME secret is empty."
+              exit 1
           }
 
-          if ([string]::IsNullOrWhiteSpace($env:TAILSCALE_AUTH_KEY)) {
-            throw "TAILSCALE_AUTH_KEY secret is missing."
+          # Check password
+          if ([string]::IsNullOrWhiteSpace($password)) {
+              Write-Error "RDP_PASSWORD secret is empty."
+              exit 1
           }
 
-          Write-Host "Required secrets are configured."
+          Write-Host "Creating RDP user: $username"
 
+          # Check if user already exists
+          $existingUser = Get-LocalUser `
+            -Name $username `
+            -ErrorAction SilentlyContinue
+
+          # Remove existing user
+          if ($existingUser) {
+
+              Write-Host "Existing user found. Removing it..."
+
+              Remove-LocalUser `
+                -Name $username `
+                -ErrorAction Stop
+
+              Write-Host "Existing user removed."
+          }
+
+          # Convert password
+          $securePassword = ConvertTo-SecureString `
+            $password `
+            -AsPlainText `
+            -Force
+
+          # Create local user
+          New-LocalUser `
+            -Name $username `
+            -Password $securePassword `
+            -AccountNeverExpires `
+            -PasswordNeverExpires `
+            -Description "GitHub Actions RDP User" `
+            -ErrorAction Stop
+
+          Write-Host "User created successfully."
+
+          # Add user to Administrators
+          Add-LocalGroupMember `
+            -Group "Administrators" `
+            -Member $username `
+            -ErrorAction Stop
+
+          Write-Host "Added user to Administrators."
+
+          # Add user to Remote Desktop Users
+          Add-LocalGroupMember `
+            -Group "Remote Desktop Users" `
+            -Member $username `
+            -ErrorAction Stop
+
+          Write-Host "Added user to Remote Desktop Users."
+
+          # Export username to GitHub environment
+          echo "RDP_USERNAME=$username" >> $env:GITHUB_ENV
+
+
+      # ==========================================
+      # Install Tailscale
+      # ==========================================
       - name: Install Tailscale
         shell: powershell
         run: |
-          $ErrorActionPreference = "Stop"
 
-          $installer = Join-Path $env:TEMP "tailscale.msi"
-          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-latest-amd64.msi"
+          $url = "https://pkgs.tailscale.com/stable/tailscale-setup-1.82.0-amd64.msi"
 
-          Invoke-WebRequest -Uri $url -OutFile $installer
+          $installer = "$env:TEMP\tailscale.msi"
 
-          try {
-            $process = Start-Process msiexec.exe `
-              -ArgumentList "/i", "`"$installer`"", "/quiet", "/norestart" `
-              -Wait -PassThru
+          Write-Host "Downloading Tailscale..."
 
-            if ($process.ExitCode -notin @(0, 3010)) {
-              throw "Tailscale installation failed: $($process.ExitCode)"
-            }
-          }
-          finally {
-            Remove-Item $installer -Force -ErrorAction SilentlyContinue
-          }
+          Invoke-WebRequest `
+            -Uri $url `
+            -OutFile $installer
 
-          $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          Write-Host "Installing Tailscale..."
 
-          if (-not (Test-Path $tsExe)) {
-            throw "Tailscale executable was not found."
-          }
+          Start-Process msiexec.exe `
+            -ArgumentList "/i", "`"$installer`"", "/quiet", "/norestart" `
+            -Wait
+
+          Remove-Item `
+            $installer `
+            -Force `
+            -ErrorAction SilentlyContinue
 
           Write-Host "Tailscale installed successfully."
 
-      - name: Verify Tailscale Installation
+
+      # ==========================================
+      # Connect Tailscale
+      # ==========================================
+      - name: Connect Tailscale
         shell: powershell
         run: |
-          $ErrorActionPreference = "Stop"
 
-          $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
+          Write-Host "Waiting for Tailscale service..."
+          Start-Sleep -Seconds 10
 
-          if (-not (Test-Path $tsExe)) {
-            throw "Tailscale executable not found."
+          $tailscale = "$env:ProgramFiles\Tailscale\tailscale.exe"
+
+          if (-not (Test-Path $tailscale)) {
+              Write-Error "Tailscale executable not found."
+              exit 1
           }
 
-          Write-Host "Tailscale status:"
-          & $tsExe status
+          Write-Host "Connecting to Tailscale..."
 
-      - name: Verify Windows RDP Service
+          & $tailscale up `
+            --authkey=${{ secrets.TAILSCALE_AUTH_KEY }} `
+            --hostname=github-rdp
+
+          if ($LASTEXITCODE -ne 0) {
+              Write-Error "Tailscale connection failed."
+              exit 1
+          }
+
+          Start-Sleep -Seconds 10
+
+          # Get Tailscale IPv4 address
+          $ip = & $tailscale ip -4
+
+          $ip = $ip.Trim()
+
+          if ([string]::IsNullOrWhiteSpace($ip)) {
+
+              Write-Error "Tailscale IP not found."
+              exit 1
+          }
+
+          Write-Host "Tailscale IP: $ip"
+
+          echo "TAILSCALE_IP=$ip" >> $env:GITHUB_ENV
+
+
+      # ==========================================
+      # Test RDP
+      # ==========================================
+      - name: Test RDP Connection
         shell: powershell
         run: |
-          $ErrorActionPreference = "Stop"
 
-          $service = Get-Service -Name TermService
+          Write-Host ""
+          Write-Host "Testing RDP connection..."
+          Write-Host "Tailscale IP: $env:TAILSCALE_IP"
+          Write-Host ""
 
-          if ($service.Status -ne "Running") {
-            Start-Service -Name TermService
+          $result = Test-NetConnection `
+            -ComputerName $env:TAILSCALE_IP `
+            -Port 3389 `
+            -WarningAction SilentlyContinue
+
+          if (!$result.TcpTestSucceeded) {
+
+              Write-Host ""
+              Write-Host "RDP port 3389 is NOT reachable."
+              Write-Host ""
+
+              Write-Error "RDP Port 3389 failed."
+              exit 1
           }
 
-          Get-NetTCPConnection -State Listen -LocalPort 3389 `
-            -ErrorAction SilentlyContinue |
-            Select-Object LocalAddress, LocalPort, State
+          Write-Host ""
+          Write-Host "RDP Port 3389 is OPEN."
+          Write-Host "RDP connection test successful."
+          Write-Host ""
 
-          Write-Host "RDP service check complete."
+
+      # ==========================================
+      # Keep Runner Alive
+      # ==========================================
+      - name: Maintain Connection
+        shell: powershell
+        run: |
+
+          Write-Host ""
+          Write-Host "=========================================="
+          Write-Host "              RDP READY"
+          Write-Host "=========================================="
+          Write-Host ""
+          Write-Host "Address : $env:TAILSCALE_IP"
+          Write-Host "Username: $env:RDP_USERNAME"
+          Write-Host "Password: GitHub RDP_PASSWORD Secret"
+          Write-Host ""
+          Write-Host "RDP Port: 3389"
+          Write-Host "=========================================="
+          Write-Host ""
+
+          while ($true) {
+
+              Write-Host "[$(Get-Date)] RDP Running"
+
+              & "$env:ProgramFiles\Tailscale\tailscale.exe" status
+
+              Start-Sleep -Seconds 60
+          }

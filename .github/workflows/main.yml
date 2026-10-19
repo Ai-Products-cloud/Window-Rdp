@@ -22,7 +22,6 @@ jobs:
             -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server' `
             -Name 'fDenyTSConnections' -Value 0
 
-          # Keep Network Level Authentication enabled.
           Set-ItemProperty `
             -Path 'HKLM:\System\CurrentControlSet\Control\Terminal Server\WinStations\RDP-Tcp' `
             -Name 'UserAuthentication' -Value 1
@@ -33,9 +32,9 @@ jobs:
 
           Enable-NetFirewallRule -DisplayGroup 'Remote Desktop'
 
-          Write-Host "RDP security settings configured."
+          Write-Host "RDP security configured."
 
-      - name: Check Required Secrets
+      - name: Validate Secrets
         shell: powershell
         env:
           RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
@@ -82,17 +81,35 @@ jobs:
             throw "Tailscale executable was not found."
           }
 
-          Write-Host "Tailscale installed."
+          Write-Host "Tailscale installed successfully."
 
-      - name: Verify Environment
+      - name: Verify Tailscale Installation
         shell: powershell
         run: |
           $ErrorActionPreference = "Stop"
 
-          Get-ComputerInfo |
-            Select-Object WindowsProductName, WindowsVersion
+          $tsExe = "$env:ProgramFiles\Tailscale\tailscale.exe"
 
-          Get-Service TermService |
-            Select-Object Name, Status
+          if (-not (Test-Path $tsExe)) {
+            throw "Tailscale executable not found."
+          }
 
-          Write-Host "Environment check complete."
+          Write-Host "Tailscale status:"
+          & $tsExe status
+
+      - name: Verify Windows RDP Service
+        shell: powershell
+        run: |
+          $ErrorActionPreference = "Stop"
+
+          $service = Get-Service -Name TermService
+
+          if ($service.Status -ne "Running") {
+            Start-Service -Name TermService
+          }
+
+          Get-NetTCPConnection -State Listen -LocalPort 3389 `
+            -ErrorAction SilentlyContinue |
+            Select-Object LocalAddress, LocalPort, State
+
+          Write-Host "RDP service check complete."

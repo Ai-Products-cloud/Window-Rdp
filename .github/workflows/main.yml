@@ -1,68 +1,64 @@
 
-$ErrorActionPreference = "Stop"
+name: Configure RDP User
 
-$username = "***"
-$password = $env:RDP_PASSWORD
+on:
+  workflow_dispatch:
 
-if ([string]::IsNullOrWhiteSpace($password)) {
-    throw "RDP_PASSWORD secret is missing or empty."
-}
+jobs:
+  configure-rdp:
+    runs-on: windows-latest
 
-Write-Host "Disabling local password complexity policy..."
+    steps:
+      - name: Create RDP User
+        shell: pwsh
+        env:
+          RDP_PASSWORD: ${{ secrets.RDP_PASSWORD }}
+        run: |
+          $ErrorActionPreference = "Stop"
 
-$config = Join-Path $env:TEMP "security-policy.cfg"
-$db = Join-Path $env:TEMP "security-policy.sdb"
+          $username = "***"
+          $password = $env:RDP_PASSWORD
 
-# Export the current local security policy
-secedit /export /cfg $config
-if ($LASTEXITCODE -ne 0) {
-    throw "Failed to export local security policy."
-}
+          if ([string]::IsNullOrWhiteSpace($password)) {
+              throw "RDP_PASSWORD secret is missing or empty."
+          }
 
-# Disable password complexity in the exported policy
-$content = Get-Content $config -Raw
+          $config = Join-Path $env:TEMP "security-policy.cfg"
+          $db = Join-Path $env:TEMP "security-policy.sdb"
 
-if ($content -match '(?m)^\s*PasswordComplexity\s*=') {
-    $content = $content -replace '(?m)^\s*PasswordComplexity\s*=\s*\d+', 'PasswordComplexity = 0'
-} else {
-    $content += "`r`nPasswordComplexity = 0`r`n"
-}
+          secedit /export /cfg $config
+          if ($LASTEXITCODE -ne 0) {
+              throw "Failed to export local security policy."
+          }
 
-Set-Content -Path $config -Value $content -Encoding Unicode
+          $content = Get-Content $config -Raw
+          $content = $content -replace '(?m)^\s*PasswordComplexity\s*=\s*\d+', 'PasswordComplexity = 0'
 
-# Apply the security policy
-secedit /configure /db $db /cfg $config /areas SECURITYPOLICY
-if ($LASTEXITCODE -ne 0) {
-    throw "Failed to apply local security policy."
-}
+          Set-Content -Path $config -Value $content -Encoding Unicode
 
-Write-Host "Password complexity policy updated."
+          secedit /configure /db $db /cfg $config /areas SECURITYPOLICY
+          if ($LASTEXITCODE -ne 0) {
+              throw "Failed to apply local security policy."
+          }
 
-# Convert the secret to SecureString
-$securePassword = ConvertTo-SecureString $password -AsPlainText -Force
+          $securePassword = ConvertTo-SecureString $password -AsPlainText -Force
 
-# Create the local user, or update the password if the user already exists
-$user = Get-LocalUser -Name $username -ErrorAction SilentlyContinue
+          $user = Get-LocalUser -Name $username -ErrorAction SilentlyContinue
 
-if ($null -eq $user) {
-    Write-Host "Creating RDP user: $username"
+          if ($null -eq $user) {
+              New-LocalUser `
+                  -Name $username `
+                  -Password $securePassword `
+                  -Description "RDP User" `
+                  -PasswordNeverExpires `
+                  -AccountNeverExpires
+          } else {
+              Set-LocalUser -Name $username -Password $securePassword
+          }
 
-    New-LocalUser `
-        -Name $username `
-        -Password $securePassword `
-        -Description "RDP User" `
-        -PasswordNeverExpires `
-        -AccountNeverExpires
-} else {
-    Write-Host "User already exists; updating password."
-    Set-LocalUser -Name $username -Password $securePassword
-}
+          Enable-LocalUser -Name $username
 
-# Ensure the account is enabled
-Enable-LocalUser -Name $username
+          $rdpGroup = Get-LocalGroup -SID 'S-1-5-32-555'
+          Add-LocalGroupMember -Group $rdpGroup.Name -Member $username -ErrorAction SilentlyContinue
 
-# Add the user to the local Remote Desktop Users group
-$rdpGroup = Get-LocalGroup -SID 'S-1-5-32-555'
-Add-LocalGroupMember -Group $rdpGroup.Name -Member $username -ErrorAction SilentlyContinue
-
-Write-Host "RDP user setup completed."
+          Write-Host "RDP user setup completed."
